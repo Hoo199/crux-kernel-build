@@ -1,18 +1,15 @@
-# Yume Kernel v3.1.2 —— PSTORE 调试版云编译
+# Yume Kernel v3.1.2 —— 屏幕控制台（fbcon）调试版
 #
-# 目的：修好 pstore，让 OS4 第一次阶段 init 的内核日志能跨重启留下。
-# 原版内核打印 "pstore: allocate compression buffer error!"，
-# 原因是 CONFIG_PSTORE_COMPRESS_DEFAULT 未设置 → zbackend 为 NULL。
-# 本 workflow 打开 zlib 后端 + 默认压缩器，同时打开 DEVTMPFS 便于首阶段。
+# 目的：让内核日志直接显示在手机屏幕上（console=tty0），
+# 这样即使 adb / pstore 全不可用，也能看到 init 死在哪一行。
 #
-# 用法：
-#   1. 打开你之前编译内核用的 GitHub 仓库
-#   2. 新建 .github/workflows/build-pstore-debug.yml，粘贴本文件全部内容并提交
-#   3. Actions 标签 → "Build Yume Kernel (PSTORE DEBUG)" → Run workflow
-#   4. 跑完后在 run 页面底部下载 artifact: crux-yume-v312-pstore-debug
-#   5. 解压到 D:\crux-roms\kernel\pstore-debug\ 并告诉我
+# 依赖：内核已有 CONFIG_DRM_MSM=y + CONFIG_DRM_MSM_DSI_STAGING=y，
+# 本 workflow 补上 VT / fbcon / fbdev emulation。
+#
+# 用法：与上一个 workflow 相同，粘到 .github/workflows/build-fbcon.yml，
+#       Actions → Run workflow → 下载 artifact: crux-yume-v312-fbcon
 
-name: Build Yume Kernel (PSTORE DEBUG)
+name: Build Yume Kernel (FBCON)
 
 on:
   workflow_dispatch:
@@ -45,60 +42,76 @@ jobs:
           tar -xzf /tmp/clang.tar.gz -C "$GITHUB_WORKSPACE/toolchain/clang"
           "$GITHUB_WORKSPACE/toolchain/clang/bin/clang" --version
 
-      - name: Patch defconfig for pstore debug
+      - name: Build config (pstore + devtmpfs + fbcon)
         run: |
-          CFG=arch/arm64/configs/crux_defconfig
-          chmod +x scripts/config
+          set -e
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          MAKE_ARGS="O=out CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip"
 
-          # 干净内核：关掉 KSU/SUSFS
+          # 先关 KSU
+          CFG=arch/arm64/configs/crux_defconfig
           sed -i 's/^CONFIG_KSU=y/# CONFIG_KSU is not set/' "$CFG"
           sed -i -E 's/^CONFIG_KSU_SUSFS[A-Z0-9_]*=y/# & is not set/' "$CFG"
 
-          # 新 Android 必需项
-          for c in CONFIG_CGROUP_FREEZER=y CONFIG_BPF_SYSCALL=y \
-                   CONFIG_PSTORE=y CONFIG_PSTORE_CONSOLE=y CONFIG_PSTORE_RAM=y \
-                   CONFIG_PSTORE_ZLIB_COMPRESS=y CONFIG_DEVTMPFS=y \
-                   CONFIG_DEVTMPFS_MOUNT=y; do
-            k=${c%%=*}
-            grep -q "^$k=" "$CFG" || echo "$c" >> "$CFG"
-            sed -i "s/^# $k is not set/$c/" "$CFG"
-          done
+          make -j$(nproc) $MAKE_ARGS crux_defconfig
 
-          # 关键：设置默认压缩器，否则 zbackend=NULL → 压缩缓冲分配失败
-          scripts/config --file "$CFG" --set-str PSTORE_COMPRESS_DEFAULT zlib
+          chmod +x scripts/config
+          C="scripts/config --file out/.config"
+          # --- 日志通道 ---
+          $C --enable PSTORE
+          $C --enable PSTORE_CONSOLE
+          $C --enable PSTORE_RAM
+          $C --enable PSTORE_ZLIB_COMPRESS
+          $C --set-str PSTORE_COMPRESS_DEFAULT zlib
+          $C --enable DEVTMPFS
+          $C --enable DEVTMPFS_MOUNT
+          # --- 屏幕控制台 ---
+          $C --enable VT
+          $C --enable VT_CONSOLE
+          $C --enable VT_HW_CONSOLE_BINDING
+          $C --enable UNIX98_PTYS
+          $C --enable FRAMEBUFFER_CONSOLE
+          $C --enable FRAMEBUFFER_CONSOLE_DETECT_PRIMARY
+          $C --enable DRM_FBDEV_EMULATION
+          $C --enable DRM_KMS_HELPER
+          $C --enable FONTS
+          $C --enable FONT_8x16
+          # --- 新 Android 必需 ---
+          $C --enable CGROUP_FREEZER
+          $C --enable BPF_SYSCALL
 
-          # 确认没有互相冲突的压缩后端
-          sed -i 's/^CONFIG_PSTORE_LZO_COMPRESS=y/# CONFIG_PSTORE_LZO_COMPRESS is not set/' "$CFG"
-          sed -i 's/^CONFIG_PSTORE_LZ4_COMPRESS=y/# CONFIG_PSTORE_LZ4_COMPRESS is not set/' "$CFG"
+          make -j$(nproc) $MAKE_ARGS olddefconfig
 
           echo "=== 关键配置复核 ==="
-          grep -E 'CONFIG_(PSTORE|DEVTMPFS|KSU|BPF|CGROUP_FREEZER|LOCALVERSION)' "$CFG" || true
+          grep -E 'CONFIG_(VT|FRAMEBUFFER_CONSOLE|DRM_FBDEV_EMULATION|PSTORE_COMPRESS_DEFAULT|DEVTMPFS|FONT_8x16)' out/.config || true
 
       - name: Build kernel
         run: |
           set -e
           export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
+          export ARCH=arm64 SUBARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
           export CLANG_TRIPLE=aarch64-linux-gnu-
           MAKE_ARGS="O=out CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip"
-          make -j$(nproc) $MAKE_ARGS crux_defconfig
           make -j$(nproc) $MAKE_ARGS
-          find out -type f \( -name 'Image*' -o -name '*.dtb' -o -name 'dtbo.img' \) -printf '%p %s bytes\n' | head -40
+          find out -type f \( -name 'Image*' -o -name 'dtbo.img' \) -printf '%p %s bytes\n' | head -20
 
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
           find out -type f \( -name 'Image.gz-dtb' -o -name 'Image.gz' -o -name 'Image' \
-            -o -name 'dtbo.img' -o -name '*.dtb' \) -exec cp -v {} artifacts/ \;
-          cp -v arch/arm64/configs/crux_defconfig artifacts/defconfig-used.txt
+            -o -name 'dtbo.img' -o -name 'sm8150*.dtb' \) -exec cp -v {} artifacts/ \;
+          cp -v out/.config artifacts/config-used.txt
           ls -lh artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: crux-yume-v312-pstore-debug
+          name: crux-yume-v312-fbcon
           path: artifacts/
           retention-days: 30
