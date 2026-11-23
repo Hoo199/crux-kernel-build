@@ -1,33 +1,21 @@
-# Yume Kernel v3.1.2 云编译 workflow（GitHub Actions）
-
-# 用法（无需 fork 源码仓库）：
-#   1. 在自己的 GitHub 账号新建一个空仓库，例如 crux-kernel-build
-#      （勾选 "Add a README file" 完成初始化）
-#   2. 在该仓库新建文件 .github/workflows/build-kernel.yml
-#      把本文件的全部内容粘进去并提交
-#   3. 打开 Actions 标签 → "Build Yume Kernel v3.1.2" → Run workflow
-#      （ksu 选项保持 false = 干净 boot）
-#   4. 编译完成后在 run 页面底部下载 artifact：crux-yume-v312-kernel
-#      解压到 D:\crux-roms\kernel\
+# Yume Kernel v3.1.2 —— PSTORE 调试版云编译
 #
-# 说明：
-#   - workflow 直接拉取原作者仓库的 v3.1.2 标签，不需要你 fork 或下载源码
-#   - 编译在云端 Ubuntu 进行，不需要本机装 clang / WSL
-#   - defconfig 已自动修改：关 KSU/SUSFS（保持 boot 干净），
-#     保留 BPF/CGROUP_FREEZER/PSTORE（新 Android 必需）
-#   - 产物：Image.gz-dtb（内核）+ dtbo.img + 配置快照
+# 目的：修好 pstore，让 OS4 第一次阶段 init 的内核日志能跨重启留下。
+# 原版内核打印 "pstore: allocate compression buffer error!"，
+# 原因是 CONFIG_PSTORE_COMPRESS_DEFAULT 未设置 → zbackend 为 NULL。
+# 本 workflow 打开 zlib 后端 + 默认压缩器，同时打开 DEVTMPFS 便于首阶段。
+#
+# 用法：
+#   1. 打开你之前编译内核用的 GitHub 仓库
+#   2. 新建 .github/workflows/build-pstore-debug.yml，粘贴本文件全部内容并提交
+#   3. Actions 标签 → "Build Yume Kernel (PSTORE DEBUG)" → Run workflow
+#   4. 跑完后在 run 页面底部下载 artifact: crux-yume-v312-pstore-debug
+#   5. 解压到 D:\crux-roms\kernel\pstore-debug\ 并告诉我
 
-name: Build Yume Kernel v3.1.2 + PSTORE LOG
+name: Build Yume Kernel (PSTORE DEBUG)
 
 on:
   workflow_dispatch:
-    inputs:
-      ksu:
-        description: 'Keep KernelSU enabled? (false = clean boot, recommended)'
-        required: false
-        default: 'false'
-        type: choice
-        options: ['false', 'true']
 
 jobs:
   build:
@@ -48,7 +36,7 @@ jobs:
             cpio curl wget git xz-utils zlib1g-dev \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
-      - name: Download Android Clang r547379 (LLVM 20)
+      - name: Download Android Clang r547379
         run: |
           mkdir -p "$GITHUB_WORKSPACE/toolchain/clang"
           curl -L --retry 3 --connect-timeout 30 \
@@ -57,42 +45,34 @@ jobs:
           tar -xzf /tmp/clang.tar.gz -C "$GITHUB_WORKSPACE/toolchain/clang"
           "$GITHUB_WORKSPACE/toolchain/clang/bin/clang" --version
 
-      - name: Patch defconfig
-        env:
-          KSU: ${{ github.event.inputs.ksu }}
+      - name: Patch defconfig for pstore debug
         run: |
           CFG=arch/arm64/configs/crux_defconfig
-          if [ "$KSU" = "false" ]; then
-            sed -i 's/^CONFIG_KSU=y/# CONFIG_KSU is not set/' "$CFG"
-            sed -i -E 's/^CONFIG_KSU_SUSFS[A-Z0-9_]*=y/# & is not set/' "$CFG"
-            echo "KSU/SUSFS disabled for clean boot"
-          else
-            echo "KSU/SUSFS kept enabled"
-          fi
-          # 确保新 Android 必需项打开（幂等）
-          grep -q '^CONFIG_CGROUP_FREEZER=y' "$CFG" || echo 'CONFIG_CGROUP_FREEZER=y' >> "$CFG"
-          grep -q '^CONFIG_BPF_SYSCALL=y' "$CFG" || echo 'CONFIG_BPF_SYSCALL=y' >> "$CFG"
-          grep -q '^CONFIG_PSTORE=y' "$CFG" || echo 'CONFIG_PSTORE=y' >> "$CFG"
-          # === 崩溃日志通道：pstore/blk 把 dmesg 写到 oops 分区(块设备后端) ===
-          # ramoops 内存后端因 dtb 地址重叠不可靠，改用 blk 后端写到持久分区
-          for opt in \
-            'CONFIG_PSTORE_BLK=y' \
-            'CONFIG_PSTORE_BLK_BLKDEV="/dev/block/by-name/oops"' \
-            'CONFIG_PSTORE_BLK_KMSG_SIZE=1048576' \
-            'CONFIG_PSTORE_BLK_PMSG_SIZE=262144' \
-            'CONFIG_PSTORE_CONSOLE=y' \
-            'CONFIG_PSTORE_DMESG=y' \
-            'CONFIG_PSTORE_PMSG=y' \
-            'CONFIG_PSTORE_RAMOOPS=y' \
-            'CONFIG_PSTORE_COMPRESS=y' \
-            'CONFIG_PSTORE_ZSTD_COMPRESS=y'; do
-            key="${opt%%=*}"
-            grep -q "^${key}=" "$CFG" || echo "$opt" >> "$CFG"
+          chmod +x scripts/config
+
+          # 干净内核：关掉 KSU/SUSFS
+          sed -i 's/^CONFIG_KSU=y/# CONFIG_KSU is not set/' "$CFG"
+          sed -i -E 's/^CONFIG_KSU_SUSFS[A-Z0-9_]*=y/# & is not set/' "$CFG"
+
+          # 新 Android 必需项
+          for c in CONFIG_CGROUP_FREEZER=y CONFIG_BPF_SYSCALL=y \
+                   CONFIG_PSTORE=y CONFIG_PSTORE_CONSOLE=y CONFIG_PSTORE_RAM=y \
+                   CONFIG_PSTORE_ZLIB_COMPRESS=y CONFIG_DEVTMPFS=y \
+                   CONFIG_DEVTMPFS_MOUNT=y; do
+            k=${c%%=*}
+            grep -q "^$k=" "$CFG" || echo "$c" >> "$CFG"
+            sed -i "s/^# $k is not set/$c/" "$CFG"
           done
-          # blk 后端需要 pstore zone 用 minor 机制，确保 core 打开
-          grep -q '^CONFIG_MTD=y' "$CFG" || echo 'CONFIG_MTD=y' >> "$CFG"
+
+          # 关键：设置默认压缩器，否则 zbackend=NULL → 压缩缓冲分配失败
+          scripts/config --file "$CFG" --set-str PSTORE_COMPRESS_DEFAULT zlib
+
+          # 确认没有互相冲突的压缩后端
+          sed -i 's/^CONFIG_PSTORE_LZO_COMPRESS=y/# CONFIG_PSTORE_LZO_COMPRESS is not set/' "$CFG"
+          sed -i 's/^CONFIG_PSTORE_LZ4_COMPRESS=y/# CONFIG_PSTORE_LZ4_COMPRESS is not set/' "$CFG"
+
           echo "=== 关键配置复核 ==="
-          grep -E 'CONFIG_(KSU|PSTORE|BPF|CGROUP_FREEZER|LOCALVERSION|MTD)' "$CFG" || true
+          grep -E 'CONFIG_(PSTORE|DEVTMPFS|KSU|BPF|CGROUP_FREEZER|LOCALVERSION)' "$CFG" || true
 
       - name: Build kernel
         run: |
@@ -106,7 +86,6 @@ jobs:
           MAKE_ARGS="O=out CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip"
           make -j$(nproc) $MAKE_ARGS crux_defconfig
           make -j$(nproc) $MAKE_ARGS
-          echo "=== 构建产物 ==="
           find out -type f \( -name 'Image*' -o -name '*.dtb' -o -name 'dtbo.img' \) -printf '%p %s bytes\n' | head -40
 
       - name: Collect artifacts
@@ -115,12 +94,11 @@ jobs:
           find out -type f \( -name 'Image.gz-dtb' -o -name 'Image.gz' -o -name 'Image' \
             -o -name 'dtbo.img' -o -name '*.dtb' \) -exec cp -v {} artifacts/ \;
           cp -v arch/arm64/configs/crux_defconfig artifacts/defconfig-used.txt
-          echo "=== 打包内容 ==="
           ls -lh artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: crux-yume-v312-kernel
+          name: crux-yume-v312-pstore-debug
           path: artifacts/
           retention-days: 30
